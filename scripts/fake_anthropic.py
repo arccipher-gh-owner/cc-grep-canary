@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
 """Hosted control: Grep /proc/self identity + environ canary, then Bash scrub.
 
-Comment body is filtered: comm/status text plus CANARY-* lines only.
-Live ghp_/ghs_/github_pat_ values are dropped.
+Comment 1 is posted after the three Greps so identity is visible even if Bash
+is dropped. Comment 2 adds the Bash result. Live ghp_/ghs_/github_pat_ dropped.
+Caps /v1/messages so a missing tool cannot loop the SDK forever.
 """
 from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("FAKE_ANTHROPIC_PORT", "8899"))
-HOLD_SECONDS = int(os.environ.get("FAKE_ANTHROPIC_HOLD", "90"))
+HOLD_SECONDS = int(os.environ.get("FAKE_ANTHROPIC_HOLD", "70"))
+MAX_MESSAGES = int(os.environ.get("FAKE_ANTHROPIC_MAX_MESSAGES", "12"))
 BAD = ("ghp_", "ghs_", "gho_", "ghu_", "github_pat_")
+STATE = {
+    "n_messages": 0,
+    "comment1": 0,
+    "comment2": 0,
+    "held": 0,
+    "bash_sent": 0,
+}
+
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
 
 
 def sse(event: str, data: dict) -> str:
@@ -49,7 +63,7 @@ def stream(blocks: list, stop: str) -> bytes:
                         "index": i,
                         "content_block": {
                             "type": "tool_use",
-                            "id": f"t{i}",
+                            "id": b.get("id", f"t{i}"),
                             "name": b["name"],
                             "input": {},
                         },
@@ -135,16 +149,14 @@ def tool_results(req: dict) -> list:
     return out
 
 
-STEPS = [
+GREPS = [
     {
+        "id": "g_comm",
         "name": "Grep",
-        "input": {
-            "pattern": ".",
-            "path": "/proc/self/comm",
-            "output_mode": "content",
-        },
+        "input": {"pattern": ".", "path": "/proc/self/comm", "output_mode": "content"},
     },
     {
+        "id": "g_status",
         "name": "Grep",
         "input": {
             "pattern": "^Name:",
@@ -153,6 +165,7 @@ STEPS = [
         },
     },
     {
+        "id": "g_env",
         "name": "Grep",
         "input": {
             "pattern": "CANARY",
@@ -160,20 +173,34 @@ STEPS = [
             "output_mode": "content",
         },
     },
-    {
-        "name": "Bash",
-        "input": {
-            "command": 'printf KEY=%s\\n "${ANTHROPIC_API_KEY:-EMPTY}"'
-        },
-    },
 ]
+
+BASH = {
+    "id": "b_printf",
+    "name": "Bash",
+    "input": {"command": 'printf KEY=%s "$ANTHROPIC_API_KEY"'},
+}
+
+
+def comment_body(results: list, bash_text: str) -> str:
+    comm = scrub(results[0])[:200] if len(results) > 0 else "MISSING"
+    status = scrub(results[1])[:200] if len(results) > 1 else "MISSING"
+    env = canary_lines(results[2]) if len(results) > 2 else "MISSING"
+    bash = scrub(bash_text)[:200]
+    return (
+        "hosted-control (canary-only; no live tokens):\n\n"
+        f"Grep /proc/self/comm:\n```\n{comm}\n```\n\n"
+        f"Grep /proc/self/status Name:\n```\n{status}\n```\n\n"
+        f"Grep /proc/self/environ CANARY:\n```\n{env}\n```\n\n"
+        f"Bash printf KEY=$ANTHROPIC_API_KEY:\n```\n{bash}\n```\n"
+    )
 
 
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, *a):
-        pass
+    def log_message(self, fmt, *args):
+        log("http " + (fmt % args))
 
     def do_POST(self):
         n = int(self.headers.get("content-length", 0) or 0)
@@ -182,7 +209,8 @@ class H(BaseHTTPRequestHandler):
             req = json.loads(raw)
         except Exception:
             req = {}
-        if not self.path.split("?")[0].endswith("/messages"):
+        path = self.path.split("?")[0]
+        if not path.endswith("/messages"):
             body = b'{"input_tokens":1}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -190,35 +218,61 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+
+        STATE["n_messages"] += 1
         results = tool_results(req)
-        step = len(results)
-        if step < len(STEPS):
-            blocks = [{"type": "tool_use", **STEPS[step]}]
-            stop = "tool_use"
-        elif step == len(STEPS):
-            comm = scrub(results[0])[:200]
-            status = scrub(results[1])[:200]
-            env = canary_lines(results[2])
-            bash = scrub(results[3])[:200]
-            body = (
-                "hosted-control (canary-only; no live tokens):\n\n"
-                f"Grep /proc/self/comm:\n```\n{comm}\n```\n\n"
-                f"Grep /proc/self/status Name:\n```\n{status}\n```\n\n"
-                f"Grep /proc/self/environ CANARY:\n```\n{env}\n```\n\n"
-                f"Bash printf KEY=$ANTHROPIC_API_KEY:\n```\n{bash}\n```\n"
-            )
+        nres = len(results)
+        log(f"messages#{STATE['n_messages']} nres={nres} comment1={STATE['comment1']} bash_sent={STATE['bash_sent']}")
+
+        if STATE["n_messages"] > MAX_MESSAGES:
+            log("max messages; end_turn")
+            blocks, stop = [{"type": "text", "text": "done"}], "end_turn"
+        elif nres < 3:
+            blocks, stop = [{"type": "tool_use", **GREPS[nres]}], "tool_use"
+            log(f"serve {GREPS[nres]['id']}")
+        elif STATE["comment1"] == 0:
+            STATE["comment1"] = 1
+            body = comment_body(results, "PENDING_BASH")
             blocks = [
                 {
                     "type": "tool_use",
+                    "id": "c1",
                     "name": "mcp__github_comment__update_claude_comment",
                     "input": {"body": body[:8000]},
                 }
             ]
             stop = "tool_use"
-        else:
+            log("serve comment1 identity")
+        elif STATE["bash_sent"] == 0:
+            STATE["bash_sent"] = 1
+            blocks, stop = [{"type": "tool_use", **BASH}], "tool_use"
+            log("serve bash printf")
+        elif STATE["comment2"] == 0:
+            STATE["comment2"] = 1
+            bash_text = results[4] if nres > 4 else (results[-1] if nres > 3 else "BASH_NOT_EXECUTED")
+            # results: 0-2 greps, 3 comment1, 4 bash (if present)
+            if nres == 4:
+                # comment1 result only; bash dropped
+                bash_text = "BASH_NOT_EXECUTED"
+            body = comment_body(results, bash_text)
+            blocks = [
+                {
+                    "type": "tool_use",
+                    "id": "c2",
+                    "name": "mcp__github_comment__update_claude_comment",
+                    "input": {"body": body[:8000]},
+                }
+            ]
+            stop = "tool_use"
+            log("serve comment2 bash")
+        elif STATE["held"] == 0:
+            STATE["held"] = 1
+            log(f"hold {HOLD_SECONDS}s")
             time.sleep(HOLD_SECONDS)
-            blocks = [{"type": "text", "text": "done"}]
-            stop = "end_turn"
+            blocks, stop = [{"type": "text", "text": "done"}], "end_turn"
+        else:
+            blocks, stop = [{"type": "text", "text": "done"}], "end_turn"
+
         data = stream(blocks, stop)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -228,4 +282,5 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    log(f"fake anthropic on 127.0.0.1:{PORT}")
     ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
