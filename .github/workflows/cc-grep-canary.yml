@@ -25,7 +25,7 @@ jobs:
           sleep 1
           kill -0 "$(cat /tmp/fake-anthropic.pid)"
 
-      - name: Run shipped Claude Code action (default tag tools)
+      - name: Run shipped Claude Code action (default tag tools + Bash control)
         uses: anthropics/claude-code-action@e4a6faad497d33dbc7144135c75e41f82f0bf6c0
         env:
           ANTHROPIC_BASE_URL: http://127.0.0.1:8899
@@ -35,3 +35,6 @@ jobs:
           anthropic_api_key: CANARY-ANTHROPIC-7f3a9c21
           github_token: ${{ secrets.GITHUB_TOKEN }}
           allowed_non_write_users: arccipher-gh-outsider
+          # Extra Bash prefixes only so the scrub control can run. Grep identity
+          # still uses default Grep. Tag mode already sets the shipped tool list.
+          claude_args: '--allowedTools "Bash(printf:*)"'

