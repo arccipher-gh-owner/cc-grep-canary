@@ -1,0 +1,37 @@
+name: cc-grep-canary
+
+# Zero-cost hosted lab: scripted local model, inert CANARY-* only in comments.
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  run:
+    if: contains(github.event.comment.body, '@claude')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start scripted Anthropic stand-in
+        run: |
+          python3 scripts/fake_anthropic.py >/tmp/fake-anthropic.log 2>&1 &
+          echo $! >/tmp/fake-anthropic.pid
+          sleep 1
+          kill -0 "$(cat /tmp/fake-anthropic.pid)"
+
+      - name: Run shipped Claude Code action (default tag tools)
+        uses: anthropics/claude-code-action@e4a6faad497d33dbc7144135c75e41f82f0bf6c0
+        env:
+          ANTHROPIC_BASE_URL: http://127.0.0.1:8899
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+          CANARY_GITHUB: CANARY-GITHUB-4b8e07d5
+        with:
+          anthropic_api_key: CANARY-ANTHROPIC-7f3a9c21
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_non_write_users: arccipher-gh-outsider
