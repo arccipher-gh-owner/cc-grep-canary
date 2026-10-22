@@ -41,7 +41,7 @@ jobs:
           # --max-turns caps a dropped-tool retry loop.
           claude_args: |
             --max-turns 12
-            --allowedTools "Bash(printf:*)"
+            --allowedTools "Bash(printenv:*)"
 
       - name: Preserve fake API log
         if: always()

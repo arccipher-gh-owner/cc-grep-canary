@@ -176,9 +176,9 @@ GREPS = [
 ]
 
 BASH = {
-    "id": "b_printf",
+    "id": "b_printenv",
     "name": "Bash",
-    "input": {"command": 'printf KEY=%s "$ANTHROPIC_API_KEY"'},
+    "input": {"command": "printenv ANTHROPIC_API_KEY"},
 }
 
 
@@ -192,7 +192,7 @@ def comment_body(results: list, bash_text: str) -> str:
         f"Grep /proc/self/comm:\n```\n{comm}\n```\n\n"
         f"Grep /proc/self/status Name:\n```\n{status}\n```\n\n"
         f"Grep /proc/self/environ CANARY:\n```\n{env}\n```\n\n"
-        f"Bash printf KEY=$ANTHROPIC_API_KEY:\n```\n{bash}\n```\n"
+        f"Bash printenv ANTHROPIC_API_KEY:\n```\n{bash if bash else 'EMPTY'}\n```\n"
     )
 
 
